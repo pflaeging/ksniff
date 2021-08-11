@@ -10,6 +10,8 @@ import (
 	"ksniff/pkg/service/sniffer/runtime"
 	"ksniff/utils"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +19,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+const cpuLimit = "500m"
+const cpuReq = "300m"
+const memLimit = "256Mi"
+const memReq = "128Mi"
 
 type KubernetesApiService interface {
 	ExecuteCommand(podName string, containerName string, command []string, stdOut io.Writer) (int, error)
@@ -146,7 +153,16 @@ func (k *KubernetesApiServiceImpl) CreatePrivilegedPod(nodeName string, containe
 	privilegedContainer := corev1.Container{
 		Name:  containerName,
 		Image: image,
-
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu":    resource.MustParse(cpuLimit),
+				"memory": resource.MustParse(memLimit),
+			},
+			Requests: corev1.ResourceList{
+				"cpu":    resource.MustParse(cpuReq),
+				"memory": resource.MustParse(memReq),
+			},
+		},
 		SecurityContext: &corev1.SecurityContext{
 			Privileged: &privileged,
 		},
