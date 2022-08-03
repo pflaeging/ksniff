@@ -4,15 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
 	"ksniff/kube"
 	"ksniff/pkg/config"
 	"ksniff/pkg/service/sniffer"
 	"ksniff/pkg/service/sniffer/runtime"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"time"
 
 	"github.com/mitchellh/go-homedir"
 	"github.com/pkg/errors"
@@ -50,6 +53,7 @@ type Ksniff struct {
 	rawConfig        api.Config
 	settings         *config.KsniffSettings
 	snifferService   sniffer.SnifferService
+	wireshark        *exec.Cmd
 }
 
 func NewKsniff(settings *config.KsniffSettings) *Ksniff {
@@ -171,9 +175,13 @@ func (o *Ksniff) Complete(cmd *cobra.Command, args []string) error {
 	o.settings.UserSpecifiedVerboseMode = viper.GetBool("verbose")
 	o.settings.UserSpecifiedPrivilegedMode = viper.GetBool("privileged")
 	o.settings.UserSpecifiedKubeContext = viper.GetString("context")
-	o.settings.UseDefaultImage = !cmd.Flag("image").Changed
-	o.settings.UseDefaultTCPDumpImage = !cmd.Flag("tcpdump-image").Changed
-	o.settings.UseDefaultSocketPath = !cmd.Flag("socket").Changed
+	o.settings.Image = viper.GetString("image")
+	o.settings.TCPDumpImage = viper.GetString("tcpdump-image")
+	o.settings.SocketPath = viper.GetString("socket")
+
+	o.settings.UseDefaultImage = !viper.IsSet("image")
+	o.settings.UseDefaultTCPDumpImage = !viper.IsSet("tcpdump-image")
+	o.settings.UseDefaultSocketPath = !viper.IsSet("socket")
 
 	var err error
 
@@ -205,12 +213,12 @@ func (o *Ksniff) Complete(cmd *cobra.Command, args []string) error {
 		return errors.New("context doesn't exist")
 	}
 
-	o.restConfig, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		&clientcmd.ClientConfigLoadingRules{ExplicitPath: o.configFlags.ToRawKubeConfigLoader().ConfigAccess().GetDefaultFilename()},
-		&clientcmd.ConfigOverrides{
-			CurrentContext: o.settings.UserSpecifiedKubeContext,
-		}).ClientConfig()
-
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{
+		CurrentContext: o.settings.UserSpecifiedKubeContext,
+	}
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+	o.restConfig, err = kubeConfig.ClientConfig()
 	if err != nil {
 		return err
 	}
@@ -343,6 +351,46 @@ func findLocalTcpdumpBinaryPath() (string, error) {
 	return "", errors.Errorf("couldn't find static tcpdump binary on any of: '%v'", tcpdumpLocalBinaryPathLookupList)
 }
 
+func (o *Ksniff) setupSignalHandler() chan interface{} {
+	signals := make(chan os.Signal, 1)
+	exit := make(chan interface{})
+
+	signal.Notify(signals, syscall.SIGINT)
+	go func() {
+		for {
+			select {
+			case sig := <-signals:
+				if sig == syscall.SIGINT || sig == syscall.SIGTERM {
+					log.Info("starting sniffer cleanup")
+					err := o.snifferService.Cleanup()
+					if err != nil {
+						log.WithError(err).Error("failed to teardown sniffer, a manual teardown is required.")
+					}
+					log.Info("sniffer cleanup completed successfully")
+
+					// Kill wireshark if used
+					if o.wireshark != nil {
+						if o.wireshark.Process != nil {
+							err = o.wireshark.Process.Kill()
+							if err != nil && err != os.ErrProcessDone {
+								log.WithError(err).Error("failed to kill wireshark process")
+							} else {
+								log.Debug("wireshark process killed")
+							}
+						}
+					}
+
+					close(signals)
+				}
+			case <-exit:
+				return
+			}
+
+		}
+	}()
+	return exit
+}
+
 func (o *Ksniff) Run() error {
 	log.Infof("sniffing on pod: '%s' [namespace: '%s', container: '%s', filter: '%s', interface: '%s']",
 		o.settings.UserSpecifiedPodName, o.resultingContext.Namespace, o.settings.UserSpecifiedContainer, o.settings.UserSpecifiedFilter, o.settings.UserSpecifiedInterface)
@@ -352,16 +400,12 @@ func (o *Ksniff) Run() error {
 		return err
 	}
 
+	// Ensure sniffer is clean on interrupt
+	closeHandler := o.setupSignalHandler()
+
+	// Ensure sniffer is clean on complete
 	defer func() {
-		log.Info("starting sniffer cleanup")
-
-		err := o.snifferService.Cleanup()
-		if err != nil {
-			log.WithError(err).Error("failed to teardown sniffer, a manual teardown is required.")
-			return
-		}
-
-		log.Info("sniffer cleanup completed successfully")
+		closeHandler <- true
 	}()
 
 	if o.settings.UserSpecifiedOutputFile != "" {
@@ -388,9 +432,9 @@ func (o *Ksniff) Run() error {
 		log.Info("spawning wireshark!")
 
 		title := fmt.Sprintf("gui.window_title:%s/%s/%s", o.resultingContext.Namespace, o.settings.UserSpecifiedPodName, o.settings.UserSpecifiedContainer)
-		cmd := exec.Command("wireshark", "-k", "-i", "-", "-o", title)
+		o.wireshark = exec.Command("wireshark", "-k", "-i", "-", "-o", title)
 
-		stdinWriter, err := cmd.StdinPipe()
+		stdinWriter, err := o.wireshark.StdinPipe()
 		if err != nil {
 			return err
 		}
@@ -399,14 +443,12 @@ func (o *Ksniff) Run() error {
 			err := o.snifferService.Start(stdinWriter)
 			if err != nil {
 				log.WithError(err).Errorf("failed to start remote sniffing, stopping wireshark")
-				_ = cmd.Process.Kill()
+				_ = o.wireshark.Process.Kill()
 			}
 		}()
 
-		err = cmd.Run()
-		if err != nil {
-			return err
-		}
+		err = o.wireshark.Run()
+		return err
 	}
 
 	return nil
